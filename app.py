@@ -3,12 +3,11 @@ Multi-model point forecast viewer
 ---------------------------------
 Click anywhere on the map and get an hourly forecast chart comparing
 UKMO (Met Office), UKV 2 km, ECMWF IFS, GFS and ICON for that point:
-wind speed + direction arrows, with cloud cover and precipitation overlaid.
+wind speed + direction arrows at a selectable level (10 m / 950 / 900 /
+850 hPa), with cloud cover and precipitation overlaid.
 
-Data source: Open-Meteo (https://open-meteo.com), which serves the native
-model output of all five models (the same models Windy.com displays) via a
-free, key-less API. Windy's own Point Forecast API requires a paid
-Professional key for ECMWF/UKV, so Open-Meteo is used by default.
+Data source: Open-Meteo (https://open-meteo.com) — native output of the
+same models Windy.com displays, via a free, key-less API.
 
 Run with:  streamlit run app.py
 """
@@ -38,15 +37,33 @@ MODELS = {
     "icon_seamless": ("ICON (DWD)", "#9467bd"),
 }
 
-HOURLY_VARS = [
-    "wind_speed_10m",
-    "wind_direction_10m",
-    "wind_gusts_10m",
-    "cloud_cover",
-    "precipitation",
-]
+# level key -> (label, Open-Meteo variable suffix)
+LEVELS = {
+    "950hPa": ("950 hPa (~600 m)", "950hPa"),
+    "900hPa": ("900 hPa (~1000 m)", "900hPa"),
+    "850hPa": ("850 hPa (~1500 m)", "850hPa"),
+    "10m": ("10 m (surface)", "10m"),
+}
 
 WIND_UNITS = {"kn": "kt", "ms": "m/s", "kmh": "km/h", "mph": "mph"}
+
+BASEMAPS = {
+    "Map": dict(tiles="OpenStreetMap", attr=None),
+    "Terrain": dict(
+        tiles="https://{s}.tile.opentopomap.org/{z}/{x}/{y}.png",
+        attr="© OpenTopoMap (CC-BY-SA), © OpenStreetMap contributors",
+    ),
+    "Hillshade": dict(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/"
+              "Elevation/World_Hillshade/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri World Hillshade",
+    ),
+    "Satellite": dict(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/"
+              "World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri World Imagery",
+    ),
+}
 
 DEFAULT_LAT, DEFAULT_LON = 55.86, -4.25  # Glasgow
 
@@ -57,15 +74,22 @@ DEFAULT_LAT, DEFAULT_LON = 55.86, -4.25  # Glasgow
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_forecast(lat: float, lon: float, model_ids: tuple[str, ...],
-                   days: int, wind_unit: str) -> dict:
+                   days: int, wind_unit: str, level_suffix: str) -> dict:
     """One Open-Meteo call covering all requested models for the point."""
+    hourly_vars = [
+        f"wind_speed_{level_suffix}",
+        f"wind_direction_{level_suffix}",
+        "wind_gusts_10m",
+        "cloud_cover",
+        "precipitation",
+    ]
     params = {
         "latitude": round(lat, 4),
         "longitude": round(lon, 4),
-        "hourly": ",".join(HOURLY_VARS),
+        "hourly": ",".join(hourly_vars),
         "models": ",".join(model_ids),
         "forecast_days": days,
-        "windspeed_unit": wind_unit,
+        "wind_speed_unit": wind_unit,
         "timezone": "auto",
     }
     r = requests.get("https://api.open-meteo.com/v1/forecast",
@@ -74,25 +98,33 @@ def fetch_forecast(lat: float, lon: float, model_ids: tuple[str, ...],
     return r.json()
 
 
-def to_frames(payload: dict, model_ids: list[str]) -> dict[str, pd.DataFrame]:
+def to_frames(payload: dict, model_ids: list[str],
+              level_suffix: str) -> dict[str, pd.DataFrame]:
     """Split the multi-model hourly block into one tidy frame per model."""
     hourly = payload.get("hourly", {})
     time_index = pd.to_datetime(hourly.get("time", []))
+    var_map = {
+        "wind_speed": f"wind_speed_{level_suffix}",
+        "wind_direction": f"wind_direction_{level_suffix}",
+        "wind_gusts": "wind_gusts_10m",
+        "cloud_cover": "cloud_cover",
+        "precipitation": "precipitation",
+    }
     frames: dict[str, pd.DataFrame] = {}
 
     for mid in model_ids:
         cols = {}
-        for var in HOURLY_VARS:
+        for generic, var in var_map.items():
             # multi-model responses suffix each variable with the model id;
             # single-model responses don't
             key = f"{var}_{mid}" if f"{var}_{mid}" in hourly else var
-            if key in hourly:
-                cols[var] = hourly[key]
-        if not cols:
+            if key in hourly and hourly[key] is not None:
+                cols[generic] = hourly[key]
+        if "wind_speed" not in cols:
             continue
         df = pd.DataFrame(cols, index=time_index)
-        # UKV is UK-only: outside its domain everything comes back null
-        if df["wind_speed_10m"].notna().sum() == 0:
+        # outside a model's domain (or missing pressure levels) -> all null
+        if df["wind_speed"].notna().sum() == 0:
             continue
         frames[mid] = df
     return frames
@@ -103,13 +135,15 @@ def to_frames(payload: dict, model_ids: list[str]) -> dict[str, pd.DataFrame]:
 # ----------------------------------------------------------------------------
 
 def build_figure(frames: dict[str, pd.DataFrame], wind_unit_label: str,
-                 show_gusts: bool, arrow_every: int = 3) -> go.Figure:
+                 level_label: str, show_gusts: bool,
+                 arrow_every: int = 3) -> go.Figure:
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
         row_heights=[0.58, 0.42],
         specs=[[{}], [{"secondary_y": True}]],
         subplot_titles=(
-            f"Wind speed ({wind_unit_label}) — arrows show direction (blowing towards)",
+            f"Wind at {level_label} ({wind_unit_label}) — arrows show "
+            f"direction (blowing towards)",
             "Cloud cover (%) and precipitation (mm/h)",
         ),
     )
@@ -119,19 +153,19 @@ def build_figure(frames: dict[str, pd.DataFrame], wind_unit_label: str,
 
         # --- wind speed line -------------------------------------------------
         fig.add_trace(go.Scatter(
-            x=df.index, y=df["wind_speed_10m"],
+            x=df.index, y=df["wind_speed"],
             mode="lines", name=label, legendgroup=mid,
             line=dict(color=colour, width=2),
             hovertemplate="%{y:.1f} " + wind_unit_label + "<extra>" + label + "</extra>",
         ), row=1, col=1)
 
-        if show_gusts and df["wind_gusts_10m"].notna().any():
+        if show_gusts and "wind_gusts" in df and df["wind_gusts"].notna().any():
             fig.add_trace(go.Scatter(
-                x=df.index, y=df["wind_gusts_10m"],
-                mode="lines", name=f"{label} gusts", legendgroup=mid,
+                x=df.index, y=df["wind_gusts"],
+                mode="lines", name=f"{label} gusts (10 m)", legendgroup=mid,
                 showlegend=False,
                 line=dict(color=colour, width=1, dash="dot"),
-                hovertemplate="gust %{y:.1f} " + wind_unit_label +
+                hovertemplate="10 m gust %{y:.1f} " + wind_unit_label +
                               "<extra>" + label + "</extra>",
             ), row=1, col=1)
 
@@ -139,14 +173,14 @@ def build_figure(frames: dict[str, pd.DataFrame], wind_unit_label: str,
         sub = df.iloc[::arrow_every]
         # met. direction = where wind comes FROM; arrow points where it goes
         fig.add_trace(go.Scatter(
-            x=sub.index, y=sub["wind_speed_10m"],
+            x=sub.index, y=sub["wind_speed"],
             mode="markers", legendgroup=mid, showlegend=False,
             marker=dict(
                 symbol="arrow", size=11, color=colour,
-                angle=(sub["wind_direction_10m"] + 180) % 360,
+                angle=(sub["wind_direction"] + 180) % 360,
                 line=dict(width=0.5, color="white"),
             ),
-            customdata=sub["wind_direction_10m"],
+            customdata=sub["wind_direction"],
             hovertemplate="from %{customdata:.0f}°<extra>" + label + "</extra>",
         ), row=1, col=1)
 
@@ -161,7 +195,7 @@ def build_figure(frames: dict[str, pd.DataFrame], wind_unit_label: str,
         ), row=2, col=1, secondary_y=False)
 
         # --- precipitation (right axis, bars) ---------------------------------
-        if df["precipitation"].notna().any() and df["precipitation"].sum() > 0:
+        if "precipitation" in df and df["precipitation"].fillna(0).sum() > 0:
             fig.add_trace(go.Bar(
                 x=df.index, y=df["precipitation"],
                 name=f"{label} precip", legendgroup=mid, showlegend=False,
@@ -205,31 +239,47 @@ with st.sidebar:
         default=list(MODELS),
         format_func=lambda m: MODELS[m][0],
     )
+    level_key = st.selectbox(
+        "Wind level", options=list(LEVELS),
+        format_func=lambda k: LEVELS[k][0], index=0,
+    )
     days = st.slider("Forecast days", 1, 7, 4)
     unit = st.selectbox("Wind unit", options=list(WIND_UNITS),
                         format_func=lambda u: WIND_UNITS[u], index=0)
-    show_gusts = st.checkbox("Show gusts (dotted)", value=True)
+    show_gusts = st.checkbox("Show 10 m gusts (dotted)", value=True)
     arrow_every = st.slider("Direction arrow every N hours", 1, 6, 3)
 
 if "point" not in st.session_state:
     st.session_state.point = (DEFAULT_LAT, DEFAULT_LON)
+if "view" not in st.session_state:
+    st.session_state.view = {"center": list(st.session_state.point), "zoom": 8}
 
 col_map, col_chart = st.columns([1, 1.6], gap="medium")
 
 with col_map:
+    # basemap choice lives in Streamlit state, so it survives reruns
+    basemap = st.radio("Basemap", options=list(BASEMAPS), horizontal=True,
+                       key="basemap", label_visibility="collapsed")
+
     lat0, lon0 = st.session_state.point
-    m = folium.Map(location=[lat0, lon0], zoom_start=8, tiles=None)
-    folium.TileLayer("OpenStreetMap", name="Map").add_to(m)
-    folium.TileLayer(
-        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/"
-              "World_Imagery/MapServer/tile/{z}/{y}/{x}",
-        attr="Esri World Imagery", name="Satellite",
-    ).add_to(m)
-    folium.LayerControl().add_to(m)
+    view = st.session_state.view
+    bm = BASEMAPS[basemap]
+    m = folium.Map(location=view["center"], zoom_start=view["zoom"],
+                   tiles=bm["tiles"], attr=bm["attr"])
     folium.Marker([lat0, lon0], tooltip="Forecast point").add_to(m)
 
-    map_state = st_folium(m, height=560, use_container_width=True,
-                          returned_objects=["last_clicked"])
+    map_state = st_folium(
+        m, height=560, use_container_width=True,
+        returned_objects=["last_clicked", "center", "zoom"],
+        key="map",
+    )
+
+    # remember where the user has panned/zoomed to
+    if map_state:
+        c, z = map_state.get("center"), map_state.get("zoom")
+        if c and z:
+            st.session_state.view = {"center": [c["lat"], c["lng"]],
+                                     "zoom": z}
 
     if map_state and map_state.get("last_clicked"):
         clicked = (map_state["last_clicked"]["lat"],
@@ -240,7 +290,8 @@ with col_map:
 
 with col_chart:
     lat, lon = st.session_state.point
-    st.markdown(f"**Point:** {lat:.4f}°, {lon:.4f}°")
+    level_label, level_suffix = LEVELS[level_key]
+    st.markdown(f"**Point:** {lat:.4f}°, {lon:.4f}° · **Level:** {level_label}")
 
     if not selected:
         st.info("Select at least one model in the sidebar.")
@@ -248,8 +299,8 @@ with col_chart:
         try:
             with st.spinner("Fetching forecasts…"):
                 payload = fetch_forecast(lat, lon, tuple(selected),
-                                         days, unit)
-            frames = to_frames(payload, selected)
+                                         days, unit, level_suffix)
+            frames = to_frames(payload, selected, level_suffix)
         except requests.RequestException as exc:
             st.error(f"Forecast request failed: {exc}")
             frames = {}
@@ -257,15 +308,19 @@ with col_chart:
         if frames:
             missing = [MODELS[m][0] for m in selected if m not in frames]
             if missing:
-                st.warning("No data here for: " + ", ".join(missing) +
-                           " (point outside model domain).")
-            fig = build_figure(frames, WIND_UNITS[unit], show_gusts,
-                               arrow_every)
+                st.warning("No data at this point/level for: " +
+                           ", ".join(missing) +
+                           " (outside model domain, or level not published "
+                           "for this model).")
+            fig = build_figure(frames, WIND_UNITS[unit], level_label,
+                               show_gusts, arrow_every)
             st.plotly_chart(fig, use_container_width=True)
 
             elev = payload.get("elevation")
             updated = dt.datetime.now().strftime("%H:%M")
-            st.caption(f"Model grid elevation ≈ {elev} m · 10 m wind · "
-                       f"retrieved {updated} · cached 30 min per point")
+            st.caption(f"Model grid elevation ≈ {elev} m · "
+                       f"retrieved {updated} · cached 30 min per "
+                       f"point/level")
         elif selected:
-            st.info("No forecast data returned for this point.")
+            st.info("No forecast data returned for this point at "
+                    f"{level_label}.")
