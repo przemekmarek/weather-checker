@@ -191,12 +191,24 @@ def build_figure(frames: dict[str, pd.DataFrame], wind_unit_label: str,
                 hovertemplate="precip %{y:.1f} mm<extra>" + label + "</extra>",
             ), row=2, col=1, secondary_y=True)
 
-    # day separators
+    # day separators and day-name labels
     if frames:
-        any_df = next(iter(frames.values()))
-        for day in pd.date_range(any_df.index[0].normalize(),
-                                 any_df.index[-1].normalize(), freq="D")[1:]:
+        idx = next(iter(frames.values())).index
+        days_seq = pd.date_range(idx[0].normalize(), idx[-1].normalize(),
+                                 freq="D")
+        for day in days_seq[1:]:
             fig.add_vline(x=day, line_width=1, line_color="rgba(0,0,0,0.15)")
+        for day in days_seq:
+            # centre the label on the hours actually present for that day
+            day_hours = idx[(idx >= day) & (idx < day + pd.Timedelta("1D"))]
+            if len(day_hours) < 6:  # skip stub partial days
+                continue
+            mid = day_hours[0] + (day_hours[-1] - day_hours[0]) / 2
+            fig.add_annotation(
+                x=mid, y=0.99, xref="x", yref="y domain",
+                text=day.strftime("%A"), showarrow=False,
+                yanchor="top", font=dict(size=13, color="rgba(0,0,0,0.5)"),
+            )
 
     fig.update_layout(
         height=720, barmode="overlay", hovermode="x unified",
