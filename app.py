@@ -79,7 +79,6 @@ def fetch_forecast(lat: float, lon: float, model_ids: tuple[str, ...],
     hourly_vars = [
         f"wind_speed_{level_suffix}",
         f"wind_direction_{level_suffix}",
-        "wind_gusts_10m",
         "cloud_cover",
         "precipitation",
     ]
@@ -106,7 +105,6 @@ def to_frames(payload: dict, model_ids: list[str],
     var_map = {
         "wind_speed": f"wind_speed_{level_suffix}",
         "wind_direction": f"wind_direction_{level_suffix}",
-        "wind_gusts": "wind_gusts_10m",
         "cloud_cover": "cloud_cover",
         "precipitation": "precipitation",
     }
@@ -135,7 +133,7 @@ def to_frames(payload: dict, model_ids: list[str],
 # ----------------------------------------------------------------------------
 
 def build_figure(frames: dict[str, pd.DataFrame], wind_unit_label: str,
-                 level_label: str, show_gusts: bool,
+                 level_label: str,
                  arrow_every: int = 3) -> go.Figure:
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
@@ -158,16 +156,6 @@ def build_figure(frames: dict[str, pd.DataFrame], wind_unit_label: str,
             line=dict(color=colour, width=2),
             hovertemplate="%{y:.1f} " + wind_unit_label + "<extra>" + label + "</extra>",
         ), row=1, col=1)
-
-        if show_gusts and "wind_gusts" in df and df["wind_gusts"].notna().any():
-            fig.add_trace(go.Scatter(
-                x=df.index, y=df["wind_gusts"],
-                mode="lines", name=f"{label} gusts (10 m)", legendgroup=mid,
-                showlegend=False,
-                line=dict(color=colour, width=1, dash="dot"),
-                hovertemplate="10 m gust %{y:.1f} " + wind_unit_label +
-                              "<extra>" + label + "</extra>",
-            ), row=1, col=1)
 
         # --- direction arrows along the speed line ---------------------------
         sub = df.iloc[::arrow_every]
@@ -246,7 +234,6 @@ with st.sidebar:
     days = st.slider("Forecast days", 1, 7, 4)
     unit = st.selectbox("Wind unit", options=list(WIND_UNITS),
                         format_func=lambda u: WIND_UNITS[u], index=0)
-    show_gusts = st.checkbox("Show 10 m gusts (dotted)", value=True)
     arrow_every = st.slider("Direction arrow every N hours", 1, 6, 3)
 
 if "point" not in st.session_state:
@@ -313,7 +300,7 @@ with col_chart:
                            " (outside model domain, or level not published "
                            "for this model).")
             fig = build_figure(frames, WIND_UNITS[unit], level_label,
-                               show_gusts, arrow_every)
+                               arrow_every)
             st.plotly_chart(fig, use_container_width=True)
 
             elev = payload.get("elevation")
