@@ -2,17 +2,21 @@
 Multi-model point forecast viewer
 ---------------------------------
 Click anywhere on the map and get an hourly forecast chart comparing
-UKMO (Met Office), UKV 2 km, ECMWF IFS, GFS and ICON for that point:
-wind speed + direction arrows at a selectable level (10 m / 950 / 900 /
-850 hPa), with cloud cover and precipitation overlaid.
+UK-relevant models for that point. Wind is shown at a selectable target
+altitude (~600 / ~1000 / ~1500 m, or 10 m surface). For each model the app
+automatically picks the closest vertical coordinate that model actually
+publishes -- a pressure level (e.g. 950 hPa) or a height level
+(e.g. 180 m AGL, as for UKV) -- and says which one in the legend.
+Models with no upper-level data at all (e.g. ECMWF if only surface is
+published) are dropped from upper-level views with a warning.
 
-Data source: Open-Meteo (https://open-meteo.com) — native output of the
-same models Windy.com displays, via a free, key-less API.
+Data source: Open-Meteo (https://open-meteo.com).
 
 Run with:  streamlit run app.py
 """
 
 import datetime as dt
+import re
 
 import folium
 import pandas as pd
@@ -34,15 +38,25 @@ MODELS = {
     "ukmo_global_deterministic_10km": ("UKMO Global 10 km", "#ff7f0e"),
     "ecmwf_ifs025": ("ECMWF IFS 0.25°", "#1f77b4"),
     "gfs_seamless": ("GFS (NOAA)", "#2ca02c"),
-    "icon_seamless": ("ICON (DWD)", "#9467bd"),
+    "icon_seamless": ("ICON Global (DWD)", "#9467bd"),
+    "icon_eu": ("ICON-EU 7 km (DWD)", "#17becf"),
+    "dmi_harmonie_arome_europe": ("DMI HARMONIE 2 km", "#8c564b"),
+    "knmi_harmonie_arome_europe": ("KNMI HARMONIE 5.5 km", "#e377c2"),
+    "meteofrance_arpege_europe": ("ARPEGE Europe 11 km", "#bcbd22"),
 }
 
-# level key -> (label, Open-Meteo variable suffix)
-LEVELS = {
-    "950hPa": ("950 hPa (~600 m)", "950hPa"),
-    "900hPa": ("900 hPa (~1000 m)", "900hPa"),
-    "850hPa": ("850 hPa (~1500 m)", "850hPa"),
-    "10m": ("10 m (surface)", "10m"),
+# pressure level -> approx altitude (m AMSL, ICAO standard atmosphere)
+PRESSURE_ALT = {1000: 110, 975: 320, 950: 600, 925: 800,
+                900: 1000, 850: 1500, 800: 1900}
+# above-ground height levels commonly published via Open-Meteo
+HEIGHT_LEVELS = [80, 100, 120, 180]
+
+# target key -> (label, target altitude in m; None = 10 m surface)
+TARGETS = {
+    "600": ("~600 m (≈950 hPa)", 600),
+    "1000": ("~1000 m (≈900 hPa)", 1000),
+    "1500": ("~1500 m (≈850 hPa)", 1500),
+    "sfc": ("10 m (surface)", None),
 }
 
 WIND_UNITS = {"kn": "kt", "ms": "m/s", "kmh": "km/h", "mph": "mph"}
@@ -69,62 +83,112 @@ DEFAULT_LAT, DEFAULT_LON = 55.86, -4.25  # Glasgow
 
 
 # ----------------------------------------------------------------------------
+# Level candidates
+# ----------------------------------------------------------------------------
+
+def candidate_levels(target: int | None) -> list[tuple[str, float, str, str]]:
+    """Vertical coordinates worth requesting for a target altitude.
+
+    Returns (variable suffix, nominal altitude m, display label, kind),
+    sorted by closeness to the target. Pressure wins ties over height.
+    """
+    if target is None:
+        return [("10m", 10.0, "10 m", "height")]
+    cands = []
+    for p, alt in PRESSURE_ALT.items():
+        if abs(alt - target) <= 700:
+            cands.append((f"{p}hPa", float(alt), f"{p} hPa", "pressure"))
+    for h in HEIGHT_LEVELS:
+        cands.append((f"{h}m", float(h), f"{h} m AGL", "height"))
+    cands.sort(key=lambda c: (abs(c[1] - target), 0 if c[3] == "pressure" else 1))
+    return cands
+
+
+# ----------------------------------------------------------------------------
 # Data fetching
 # ----------------------------------------------------------------------------
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_forecast(lat: float, lon: float, model_ids: tuple[str, ...],
-                   days: int, wind_unit: str, level_suffix: str) -> dict:
-    """One Open-Meteo call covering all requested models for the point."""
-    hourly_vars = [
-        f"wind_speed_{level_suffix}",
-        f"wind_direction_{level_suffix}",
-        "cloud_cover",
-        "precipitation",
-    ]
-    params = {
-        "latitude": round(lat, 4),
-        "longitude": round(lon, 4),
-        "hourly": ",".join(hourly_vars),
-        "models": ",".join(model_ids),
-        "forecast_days": days,
-        "wind_speed_unit": wind_unit,
-        "timezone": "auto",
-    }
-    r = requests.get("https://api.open-meteo.com/v1/forecast",
-                     params=params, timeout=30)
-    r.raise_for_status()
-    return r.json()
+                   days: int, wind_unit: str, target_key: str) -> dict:
+    """One Open-Meteo call covering all models and all candidate levels.
+
+    If the API rejects a variable name some endpoint doesn't know
+    (HTTP 400 with the offending name in `reason`), that level is removed
+    and the request retried, so an over-optimistic candidate list degrades
+    gracefully rather than failing.
+    """
+    target = TARGETS[target_key][1]
+    suffixes = [c[0] for c in candidate_levels(target)]
+    hourly = ([f"wind_{w}_{s}" for s in suffixes
+               for w in ("speed", "direction")]
+              + ["cloud_cover", "precipitation"])
+
+    for _ in range(len(suffixes) + 1):
+        params = {
+            "latitude": round(lat, 4),
+            "longitude": round(lon, 4),
+            "hourly": ",".join(hourly),
+            "models": ",".join(model_ids),
+            "forecast_days": days,
+            "wind_speed_unit": wind_unit,
+            "timezone": "auto",
+        }
+        r = requests.get("https://api.open-meteo.com/v1/forecast",
+                         params=params, timeout=30)
+        if r.ok:
+            return r.json()
+        try:
+            reason = r.json().get("reason", "")
+        except ValueError:
+            reason = r.text
+        bad = [v for v in hourly if re.search(rf"\b{re.escape(v)}\b", reason)]
+        if r.status_code == 400 and bad:
+            # drop the whole offending level (speed + direction)
+            bad_sfx = {v.split("_", 2)[2] for v in bad}
+            hourly = [v for v in hourly
+                      if v in ("cloud_cover", "precipitation")
+                      or v.split("_", 2)[2] not in bad_sfx]
+            continue
+        r.raise_for_status()
+    raise requests.RequestException("No valid wind variables accepted by API")
 
 
-def to_frames(payload: dict, model_ids: list[str],
-              level_suffix: str) -> dict[str, pd.DataFrame]:
-    """Split the multi-model hourly block into one tidy frame per model."""
+def to_frames(payload: dict, model_ids: list[str], target_key: str
+              ) -> dict[str, tuple[pd.DataFrame, str]]:
+    """Per model: pick the closest level with data; return (frame, level label)."""
     hourly = payload.get("hourly", {})
     time_index = pd.to_datetime(hourly.get("time", []))
-    var_map = {
-        "wind_speed": f"wind_speed_{level_suffix}",
-        "wind_direction": f"wind_direction_{level_suffix}",
-        "cloud_cover": "cloud_cover",
-        "precipitation": "precipitation",
-    }
-    frames: dict[str, pd.DataFrame] = {}
+    target = TARGETS[target_key][1]
+    cands = candidate_levels(target)
+    frames: dict[str, tuple[pd.DataFrame, str]] = {}
+
+    def col(var: str, mid: str):
+        # multi-model responses suffix each variable with the model id;
+        # single-model responses don't
+        for key in (f"{var}_{mid}", var):
+            vals = hourly.get(key)
+            if vals is not None and any(v is not None for v in vals):
+                return vals
+        return None
 
     for mid in model_ids:
-        cols = {}
-        for generic, var in var_map.items():
-            # multi-model responses suffix each variable with the model id;
-            # single-model responses don't
-            key = f"{var}_{mid}" if f"{var}_{mid}" in hourly else var
-            if key in hourly and hourly[key] is not None:
-                cols[generic] = hourly[key]
-        if "wind_speed" not in cols:
+        chosen = None
+        for sfx, _alt, lvl_label, _kind in cands:  # already closest-first
+            speed = col(f"wind_speed_{sfx}", mid)
+            direction = col(f"wind_direction_{sfx}", mid)
+            if speed is not None and direction is not None:
+                chosen = (speed, direction, lvl_label)
+                break
+        if chosen is None:
             continue
-        df = pd.DataFrame(cols, index=time_index)
-        # outside a model's domain (or missing pressure levels) -> all null
-        if df["wind_speed"].notna().sum() == 0:
-            continue
-        frames[mid] = df
+        df = pd.DataFrame({
+            "wind_speed": chosen[0],
+            "wind_direction": chosen[1],
+            "cloud_cover": col("cloud_cover", mid),
+            "precipitation": col("precipitation", mid),
+        }, index=time_index)
+        frames[mid] = (df, chosen[2])
     return frames
 
 
@@ -132,29 +196,31 @@ def to_frames(payload: dict, model_ids: list[str],
 # Plotting
 # ----------------------------------------------------------------------------
 
-def build_figure(frames: dict[str, pd.DataFrame], wind_unit_label: str,
-                 level_label: str,
+def build_figure(frames: dict[str, tuple[pd.DataFrame, str]],
+                 wind_unit_label: str, target_label: str,
                  arrow_every: int = 3) -> go.Figure:
     fig = make_subplots(
         rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.06,
         row_heights=[0.58, 0.42],
         specs=[[{}], [{"secondary_y": True}]],
         subplot_titles=(
-            f"Wind at {level_label} ({wind_unit_label}) — arrows show "
-            f"direction (blowing towards)",
+            f"Wind near {target_label} ({wind_unit_label}) — level used per "
+            f"model shown in legend; arrows show direction (blowing towards)",
             "Cloud cover (%) and precipitation (mm/h)",
         ),
     )
 
-    for mid, df in frames.items():
+    for mid, (df, lvl_label) in frames.items():
         label, colour = MODELS[mid]
+        name = f"{label} · {lvl_label}"
 
         # --- wind speed line -------------------------------------------------
         fig.add_trace(go.Scatter(
             x=df.index, y=df["wind_speed"],
-            mode="lines", name=label, legendgroup=mid,
+            mode="lines", name=name, legendgroup=mid,
             line=dict(color=colour, width=2),
-            hovertemplate="%{y:.1f} " + wind_unit_label + "<extra>" + label + "</extra>",
+            hovertemplate="%{y:.1f} " + wind_unit_label +
+                          "<extra>" + name + "</extra>",
         ), row=1, col=1)
 
         # --- direction arrows along the speed line ---------------------------
@@ -169,21 +235,22 @@ def build_figure(frames: dict[str, pd.DataFrame], wind_unit_label: str,
                 line=dict(width=0.5, color="white"),
             ),
             customdata=sub["wind_direction"],
-            hovertemplate="from %{customdata:.0f}°<extra>" + label + "</extra>",
+            hovertemplate="from %{customdata:.0f}°<extra>" + name + "</extra>",
         ), row=1, col=1)
 
         # --- cloud cover (left axis) -----------------------------------------
-        fig.add_trace(go.Scatter(
-            x=df.index, y=df["cloud_cover"],
-            mode="lines", name=f"{label} cloud", legendgroup=mid,
-            showlegend=False,
-            line=dict(color=colour, width=1.5),
-            opacity=0.7,
-            hovertemplate="cloud %{y:.0f}%<extra>" + label + "</extra>",
-        ), row=2, col=1, secondary_y=False)
+        if df["cloud_cover"].notna().any():
+            fig.add_trace(go.Scatter(
+                x=df.index, y=df["cloud_cover"],
+                mode="lines", name=f"{label} cloud", legendgroup=mid,
+                showlegend=False,
+                line=dict(color=colour, width=1.5),
+                opacity=0.7,
+                hovertemplate="cloud %{y:.0f}%<extra>" + label + "</extra>",
+            ), row=2, col=1, secondary_y=False)
 
         # --- precipitation (right axis, bars) ---------------------------------
-        if "precipitation" in df and df["precipitation"].fillna(0).sum() > 0:
+        if df["precipitation"].fillna(0).sum() > 0:
             fig.add_trace(go.Bar(
                 x=df.index, y=df["precipitation"],
                 name=f"{label} precip", legendgroup=mid, showlegend=False,
@@ -193,27 +260,26 @@ def build_figure(frames: dict[str, pd.DataFrame], wind_unit_label: str,
 
     # day separators and day-name labels
     if frames:
-        idx = next(iter(frames.values())).index
+        idx = next(iter(frames.values()))[0].index
         days_seq = pd.date_range(idx[0].normalize(), idx[-1].normalize(),
                                  freq="D")
         for day in days_seq[1:]:
             fig.add_vline(x=day, line_width=1, line_color="rgba(0,0,0,0.15)")
         for day in days_seq:
-            # centre the label on the hours actually present for that day
             day_hours = idx[(idx >= day) & (idx < day + pd.Timedelta("1D"))]
             if len(day_hours) < 6:  # skip stub partial days
                 continue
-            mid = day_hours[0] + (day_hours[-1] - day_hours[0]) / 2
+            mid_t = day_hours[0] + (day_hours[-1] - day_hours[0]) / 2
             fig.add_annotation(
-                x=mid, y=0.99, xref="x", yref="y domain",
+                x=mid_t, y=0.99, xref="x", yref="y domain",
                 text=day.strftime("%A"), showarrow=False,
                 yanchor="top", font=dict(size=13, color="rgba(0,0,0,0.5)"),
             )
 
     fig.update_layout(
-        height=720, barmode="overlay", hovermode="x unified",
+        height=740, barmode="overlay", hovermode="x unified",
         legend=dict(orientation="h", yanchor="bottom", y=1.04, x=0),
-        margin=dict(l=50, r=50, t=80, b=40),
+        margin=dict(l=50, r=50, t=90, b=40),
     )
     fig.update_yaxes(title_text=wind_unit_label, rangemode="tozero", row=1, col=1)
     fig.update_yaxes(title_text="Cloud cover %", range=[0, 100],
@@ -228,8 +294,9 @@ def build_figure(frames: dict[str, pd.DataFrame], wind_unit_label: str,
 # ----------------------------------------------------------------------------
 
 st.title("Multi-model point forecast")
-st.caption("Click anywhere on the map to compare UKV, UKMO, ECMWF, GFS and "
-           "ICON forecasts for that point (native model data via Open-Meteo).")
+st.caption("Click anywhere on the map to compare model forecasts for that "
+           "point (native model data via Open-Meteo). Each model uses the "
+           "pressure or height level closest to the chosen altitude.")
 
 with st.sidebar:
     st.header("Settings")
@@ -239,9 +306,9 @@ with st.sidebar:
         default=list(MODELS),
         format_func=lambda m: MODELS[m][0],
     )
-    level_key = st.selectbox(
-        "Wind level", options=list(LEVELS),
-        format_func=lambda k: LEVELS[k][0], index=0,
+    target_key = st.selectbox(
+        "Wind altitude", options=list(TARGETS),
+        format_func=lambda k: TARGETS[k][0], index=0,
     )
     days = st.slider("Forecast days", 1, 7, 4)
     unit = st.selectbox("Wind unit", options=list(WIND_UNITS),
@@ -289,8 +356,9 @@ with col_map:
 
 with col_chart:
     lat, lon = st.session_state.point
-    level_label, level_suffix = LEVELS[level_key]
-    st.markdown(f"**Point:** {lat:.4f}°, {lon:.4f}° · **Level:** {level_label}")
+    target_label = TARGETS[target_key][0]
+    st.markdown(f"**Point:** {lat:.4f}°, {lon:.4f}° · "
+                f"**Altitude:** {target_label}")
 
     if not selected:
         st.info("Select at least one model in the sidebar.")
@@ -298,8 +366,8 @@ with col_chart:
         try:
             with st.spinner("Fetching forecasts…"):
                 payload = fetch_forecast(lat, lon, tuple(selected),
-                                         days, unit, level_suffix)
-            frames = to_frames(payload, selected, level_suffix)
+                                         days, unit, target_key)
+            frames = to_frames(payload, selected, target_key)
         except requests.RequestException as exc:
             st.error(f"Forecast request failed: {exc}")
             frames = {}
@@ -307,19 +375,17 @@ with col_chart:
         if frames:
             missing = [MODELS[m][0] for m in selected if m not in frames]
             if missing:
-                st.warning("No data at this point/level for: " +
-                           ", ".join(missing) +
-                           " (outside model domain, or level not published "
-                           "for this model).")
-            fig = build_figure(frames, WIND_UNITS[unit], level_label,
+                st.warning("Dropped (no wind data at this point near "
+                           f"{target_label}): " + ", ".join(missing))
+            fig = build_figure(frames, WIND_UNITS[unit], target_label,
                                arrow_every)
             st.plotly_chart(fig, use_container_width=True)
 
             elev = payload.get("elevation")
             updated = dt.datetime.now().strftime("%H:%M")
-            st.caption(f"Model grid elevation ≈ {elev} m · "
-                       f"retrieved {updated} · cached 30 min per "
-                       f"point/level")
+            st.caption(f"Model grid elevation ≈ {elev} m · pressure-level "
+                       f"altitudes are AMSL (std. atmosphere); height levels "
+                       f"are AGL · retrieved {updated} · cached 30 min")
         elif selected:
-            st.info("No forecast data returned for this point at "
-                    f"{level_label}.")
+            st.info("No forecast data returned for this point near "
+                    f"{target_label}.")
